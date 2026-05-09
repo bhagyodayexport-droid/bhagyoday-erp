@@ -1,0 +1,143 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && request.auth.token.email.lower() == 'bhagyoday.export@gmail.com';
+    }
+
+    // 1. Global Super Admin Bypass (Instant Permissions)
+    match /{document=**} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    function isVerifiedEmployee() {
+      return isSuperAdmin() || (isEmployee() && isEmailVerified());
+    }
+
+    function isVerifiedAdmin() {
+      return isSuperAdmin() || (isAdmin() && isEmailVerified());
+    }
+
+    function getRole(uid) {
+      // Use get() cautiously as it counts towards the 10-lookup limit per request
+      return get(/databases/$(database)/documents/users/$(uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isSuperAdmin() || (isSignedIn() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'developer']
+      );
+    }
+
+    function isEmployee() {
+      return isSuperAdmin() || (isSignedIn() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'developer', 'employee'])
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Collections ---
+
+    // Users
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      // Last seen updates
+      allow update: if isSignedIn() && request.auth.uid == userId && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['lastSeen', 'updatedAt']) ||
+        isAdmin()
+      );
+      // Allow profile creation - only employees can register themselves
+      // Admins must be created via system/bootstrap
+      allow create: if isSignedIn() && request.auth.uid == userId && (
+        (incoming().role == 'employee' && incoming().keys().hasAll(['uid', 'email', 'role'])) ||
+        request.auth.token.email.lower() == 'bhagyoday.export@gmail.com'
+      );
+      allow write: if isVerifiedAdmin(); // Only verified admins can manage roles
+    }
+
+    // Quotations
+    match /quotations/{quotationId} {
+      function isValidQuotation(data) {
+        return data.keys().hasAll(['estNo', 'custName', 'items', 'status']) &&
+               data.custName is string && 
+               data.items is list;
+      }
+
+      allow read: if isEmployee();
+      allow create: if isVerifiedEmployee() && isValidQuotation(incoming());
+      allow update: if isVerifiedEmployee() && (
+        isValidQuotation(incoming()) || 
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'statusHistory', 'reason']) ||
+        // Stock deduction updates
+        incoming().diff(existing()).affectedKeys().hasAny(['totalProfit', 'isHotDeal', 'isDeducted', 'updatedAt'])
+      );
+      allow delete: if isVerifiedAdmin();
+    }
+
+    // Clients
+    match /clients/{clientId} {
+      allow read: if isEmployee();
+      allow write: if isVerifiedEmployee() && incoming().keys().hasAll(['name']);
+      allow delete: if isVerifiedAdmin();
+    }
+
+    // Settings
+    match /settings/global {
+      allow read: if isEmployee();
+      // Allow employees to update counter, rates, templates (since they manage the shop)
+      allow update: if isVerifiedEmployee() && (
+        isAdmin() ||
+        incoming().diff(existing()).affectedKeys().hasAny(['estCounter', 'rates', 'descTmpls', 'updatedAt'])
+      );
+      allow write: if isVerifiedAdmin();
+    }
+
+    // Inventory
+    match /inventory/{itemId} {
+      function isValidInventory(data) {
+        return data.keys().hasAll(['make', 'colour', 'remainingStockRFT']) &&
+               data.make is string &&
+               data.remainingStockRFT is number;
+      }
+
+      allow read: if isEmployee();
+      allow create: if isVerifiedEmployee() && isValidInventory(incoming());
+      allow update: if isVerifiedEmployee() && (
+        isAdmin() ||
+        // Stock deduction or threshold update
+        incoming().diff(existing()).affectedKeys().hasAny(['remainingStockRFT', 'usedStockRFT', 'lastUpdated', 'lowStockThreshold'])
+      );
+      allow delete: if isVerifiedAdmin();
+    }
+
+    // Dispatch Logs
+    match /dispatch_logs/{logId} {
+      allow read: if isEmployee();
+      allow create: if isVerifiedEmployee() && incoming().keys().hasAll(['quotationId', 'materialKey', 'qtyDeducted']);
+      allow delete: if isVerifiedAdmin();
+    }
+  }
+}
